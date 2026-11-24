@@ -1,11 +1,8 @@
-"""Entry point for the NeatSprint Reports Service.
-
-The service owns its logical database and exposes only its public API. Cross-service
-access happens over HTTP or events, never through a shared database (ADR-002).
-"""
+"""Entry point for the NeatSprint Reports Service."""
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -13,18 +10,19 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from neatsprint_lib.api import create_health_router, install_platform_middleware
+from neatsprint_lib.auth import TokenVerifier, install_auth
 from neatsprint_lib.db import check_database, create_engine, create_session_factory
 from neatsprint_lib.errors import install_error_handlers
 from neatsprint_lib.logging import configure_logging
 
-from neatsprint_reports.api.router import api_router
+from neatsprint_reports.api.router import router
+from neatsprint_reports.services.projector import run_consumer
 from neatsprint_reports.settings import settings
 
 configure_logging(settings.service_name, settings.log_level, settings.version)
 
 
 def _database_check() -> Any:
-    """Readiness check bound to the engine created in the lifespan."""
     engine = getattr(app.state, "engine", None)
     if engine is None:
         return True
@@ -38,9 +36,38 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         engine = create_engine(settings.database_url)
         app.state.engine = engine
         app.state.session_factory = create_session_factory(engine)
+    if settings.jwks_url:
+        verifier = TokenVerifier(
+            issuer=settings.jwt_issuer,
+            audience=settings.jwt_audience,
+            jwks_url=settings.jwks_url,
+        )
+        install_auth(app, verifier)
+        app.state.token_verifier = verifier
+
+    consumer_stop: asyncio.Event | None = None
+    consumer_task: asyncio.Task[None] | None = None
+    if engine is not None and settings.redis_url:
+        consumer_stop = asyncio.Event()
+        consumer_task = asyncio.create_task(
+            run_consumer(
+                app.state.session_factory,
+                settings.redis_url,
+                settings.outbox_stream,
+                settings.reports_consumer_group,
+                consumer_stop,
+            )
+        )
     try:
         yield
     finally:
+        if consumer_stop is not None:
+            consumer_stop.set()
+        if consumer_task is not None:
+            try:
+                await asyncio.wait_for(consumer_task, timeout=5)
+            except TimeoutError:
+                consumer_task.cancel()
         if engine is not None:
             await engine.dispose()
 
@@ -53,6 +80,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None if settings.is_production else "/openapi.json",
 )
+app.state.settings = settings
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,7 +101,7 @@ app.include_router(
         version=settings.version,
     )
 )
-app.include_router(api_router, prefix=f"/api/v1/{settings.api_prefix}")
+app.include_router(router, prefix=f"/api/v1/{settings.api_prefix}")
 
 
 @app.get("/", include_in_schema=False)

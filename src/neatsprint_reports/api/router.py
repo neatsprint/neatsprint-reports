@@ -116,34 +116,45 @@ async def time_report(
     if cached is not None:
         return JSONResponse(envelope(request, cached, cached=True))
 
-    query = select(ReportTimeFact).where(
-        ReportTimeFact.tenant_id == principal.tenant_id,
-        ReportTimeFact.started_at >= start,
-        ReportTimeFact.started_at < end,
+    bucket: Any
+    if group_by == "day":
+        bucket = func.date(ReportTimeFact.started_at)
+    elif group_by == "project":
+        bucket = ReportTimeFact.project_id
+    else:
+        bucket = ReportTimeFact.user_id
+    query = (
+        select(bucket.label("bucket"), func.sum(ReportTimeFact.duration_seconds))
+        .where(
+            ReportTimeFact.tenant_id == principal.tenant_id,
+            ReportTimeFact.started_at >= start,
+            ReportTimeFact.started_at < end,
+        )
+        .group_by(bucket)
+        .order_by(bucket)
     )
     if project_id is not None:
         query = query.where(ReportTimeFact.project_id == project_id)
     if user_id is not None:
         query = query.where(ReportTimeFact.user_id == user_id)
-    rows = list((await session.execute(query)).scalars())
-    buckets: dict[str, int] = defaultdict(int)
-    for row in rows:
+    rows = (await session.execute(query)).all()
+    result_rows: list[dict[str, object]] = []
+    total_seconds = 0
+    for value, seconds in rows:
         if group_by == "day":
-            bucket = row.started_at.date().isoformat()
+            key = value.isoformat()
         elif group_by == "project":
-            bucket = str(row.project_id) if row.project_id else "unassigned"
+            key = str(value) if value else "unassigned"
         else:
-            bucket = str(row.user_id)
-        buckets[bucket] += row.duration_seconds
+            key = str(value)
+        total_seconds += int(seconds or 0)
+        result_rows.append({"key": key, "seconds": int(seconds or 0)})
     payload = {
         "from": start.date().isoformat(),
         "to": (end - timedelta(days=1)).date().isoformat(),
         "group_by": group_by,
-        "total_seconds": sum(buckets.values()),
-        "rows": [
-            {"key": bucket, "seconds": seconds}
-            for bucket, seconds in sorted(buckets.items())
-        ],
+        "total_seconds": total_seconds,
+        "rows": result_rows,
     }
     cache.put(key, payload)
     return JSONResponse(envelope(request, payload))

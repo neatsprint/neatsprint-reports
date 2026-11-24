@@ -5,8 +5,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from neatsprint_lib.db import Base, TenantMixin
+from neatsprint_lib.db import Base, TenantMixin, TimestampMixin
 from neatsprint_lib.events import OutboxEvent as OutboxEvent  # noqa: F401 - register table
+from neatsprint_lib.ids import new_id
 from sqlalchemy import DateTime, Index, Integer, Numeric, String, text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -112,3 +113,21 @@ class ReportProcessedEvent(Base):
     processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
+
+
+class ReportExport(Base, TenantMixin, TimestampMixin):
+    __tablename__ = "report_exports"
+    __table_args__ = (Index("ix_report_exports_user", "tenant_id", "user_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=new_id
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    report: Mapped[str] = mapped_column(String(32), nullable=False)
+    format: Mapped[str] = mapped_column(String(8), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="PENDING")
+    from_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    to_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    storage_key: Mapped[str | None] = mapped_column(String(512))
+    error: Mapped[str | None] = mapped_column(String(500))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 from collections import defaultdict
@@ -14,10 +15,12 @@ from fastapi.responses import JSONResponse, Response
 from neatsprint_lib.auth import Principal, get_principal, require_permission
 from neatsprint_lib.db import get_tenant_session
 from neatsprint_lib.errors import ApiError
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from neatsprint_reports.db.models import (
+    ReportExport,
     ReportItemFact,
     ReportMonitorFact,
     ReportProcessedEvent,
@@ -25,7 +28,8 @@ from neatsprint_reports.db.models import (
     ReportSprintFact,
     ReportTimeFact,
 )
-from neatsprint_reports.services import cache
+from neatsprint_reports.services import cache, storage
+from neatsprint_reports.services.export import generate_export
 
 router = APIRouter(tags=["reports"])
 
@@ -35,6 +39,28 @@ ProductivityView = Annotated[Principal, Depends(require_permission("report:produ
 AgileView = Annotated[Principal, Depends(require_permission("report:agile:view"))]
 MonitoringView = Annotated[Principal, Depends(require_permission("report:monitoring:view"))]
 AuditView = Annotated[Principal, Depends(require_permission("report:audit:view"))]
+ExportPerm = Annotated[Principal, Depends(require_permission("report:export"))]
+
+_tasks: set[asyncio.Task[None]] = set()
+
+
+class ExportCreate(BaseModel):
+    report: str = Field(pattern="^(time|monitoring)$")
+    format: str = Field(pattern="^(csv|pdf)$")
+    from_date: date
+    to_date: date
+
+
+def _export_payload(job: ReportExport) -> dict[str, object]:
+    return {
+        "id": str(job.id),
+        "report": job.report,
+        "format": job.format,
+        "status": job.status,
+        "error": job.error,
+        "created_at": job.created_at.isoformat(),
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
 
 
 def envelope(request: Request, data: object, **meta: object) -> dict[str, object]:
@@ -476,6 +502,79 @@ async def export_report(
         content=buffer.getvalue().encode("utf-8"),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{report}-report.csv"'},
+    )
+
+
+@router.post("/exports", status_code=202, summary="Queue a report export")
+async def create_export(
+    payload: ExportCreate,
+    principal: ExportPerm,
+    request: Request,
+    session: SessionDep,
+) -> JSONResponse:
+    if payload.from_date > payload.to_date:
+        raise ApiError(422, "validation_failed", "The start date must precede the end date.")
+    job = ReportExport(
+        tenant_id=principal.tenant_id,
+        user_id=principal.user_id,
+        report=payload.report,
+        format=payload.format,
+        status="PENDING",
+        from_date=datetime.combine(payload.from_date, time.min, tzinfo=UTC),
+        to_date=datetime.combine(
+            payload.to_date + timedelta(days=1), time.min, tzinfo=UTC
+        ),
+    )
+    session.add(job)
+    await session.commit()
+    task = asyncio.create_task(
+        generate_export(job.id, request.app.state.session_factory, request.app.state.settings)
+    )
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+    return JSONResponse(envelope(request, _export_payload(job)), status_code=202)
+
+
+@router.get("/exports", summary="List my exports")
+async def list_exports(
+    principal: ExportPerm, request: Request, session: SessionDep
+) -> JSONResponse:
+    rows = (
+        await session.execute(
+            select(ReportExport)
+            .where(
+                ReportExport.tenant_id == principal.tenant_id,
+                ReportExport.user_id == principal.user_id,
+            )
+            .order_by(ReportExport.created_at.desc())
+            .limit(25)
+        )
+    ).scalars()
+    return JSONResponse(envelope(request, [_export_payload(row) for row in rows]))
+
+
+@router.get("/exports/{export_id}/download", summary="Download a completed export")
+async def download_export(
+    export_id: UUID,
+    principal: ExportPerm,
+    request: Request,
+    session: SessionDep,
+) -> JSONResponse:
+    job = await session.get(ReportExport, export_id)
+    if (
+        job is None
+        or job.tenant_id != principal.tenant_id
+        or job.user_id != principal.user_id
+    ):
+        raise ApiError(404, "not_found", "Export not found.")
+    if job.status != "COMPLETED" or not job.storage_key:
+        raise ApiError(409, "not_ready", "That export is not ready yet.")
+    try:
+        url = storage.presign(request.app.state.settings, job.storage_key)
+    except RuntimeError as exc:
+        raise ApiError(503, "dependency_unavailable", "Export storage is unavailable.") from exc
+    return JSONResponse(
+        envelope(request, {"download_url": url, "expires_in": 300, "format": job.format})
     )
 
 

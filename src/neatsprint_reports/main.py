@@ -15,6 +15,7 @@ from neatsprint_lib.db import check_database, create_engine, create_session_fact
 from neatsprint_lib.errors import install_error_handlers
 from neatsprint_lib.logging import configure_logging
 
+from neatsprint_reports.api.internal import router as internal_router
 from neatsprint_reports.api.router import router
 from neatsprint_reports.services.projector import run_consumer
 from neatsprint_reports.settings import settings
@@ -102,6 +103,7 @@ app.include_router(
     )
 )
 app.include_router(router, prefix=f"/api/v1/{settings.api_prefix}")
+app.include_router(internal_router)
 
 
 @app.get("/", include_in_schema=False)

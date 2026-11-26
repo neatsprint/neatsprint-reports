@@ -16,7 +16,7 @@ from neatsprint_lib.auth import Principal, get_principal, require_permission
 from neatsprint_lib.db import get_tenant_session
 from neatsprint_lib.errors import ApiError
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from neatsprint_reports.db.models import (
@@ -170,20 +170,32 @@ async def completion_report(
     project_id: UUID | None = Query(default=None),
 ) -> JSONResponse:
     start, end = _range(from_date, to_date)
-    query = select(ReportItemFact).where(
-        ReportItemFact.tenant_id == principal.tenant_id,
-        ReportItemFact.created_at < end,
+    created_query = (
+        select(func.date(ReportItemFact.created_at).label("day"), func.count())
+        .where(
+            ReportItemFact.tenant_id == principal.tenant_id,
+            ReportItemFact.created_at >= start,
+            ReportItemFact.created_at < end,
+        )
+        .group_by(func.date(ReportItemFact.created_at))
+    )
+    completed_query = (
+        select(func.date(ReportItemFact.completed_at).label("day"), func.count())
+        .where(
+            ReportItemFact.tenant_id == principal.tenant_id,
+            ReportItemFact.completed_at.is_not(None),
+            ReportItemFact.completed_at >= start,
+            ReportItemFact.completed_at < end,
+        )
+        .group_by(func.date(ReportItemFact.completed_at))
     )
     if project_id is not None:
-        query = query.where(ReportItemFact.project_id == project_id)
-    rows = list((await session.execute(query)).scalars())
-    created: dict[str, int] = defaultdict(int)
-    completed: dict[str, int] = defaultdict(int)
-    for row in rows:
-        if start <= row.created_at < end:
-            created[row.created_at.date().isoformat()] += 1
-        if row.completed_at is not None and start <= row.completed_at < end:
-            completed[row.completed_at.date().isoformat()] += 1
+        created_query = created_query.where(ReportItemFact.project_id == project_id)
+        completed_query = completed_query.where(ReportItemFact.project_id == project_id)
+    created_rows = (await session.execute(created_query)).all()
+    completed_rows = (await session.execute(completed_query)).all()
+    created = {day.isoformat(): int(count) for day, count in created_rows}
+    completed = {day.isoformat(): int(count) for day, count in completed_rows}
     days = sorted(set(created) | set(completed))
     return JSONResponse(
         envelope(
@@ -214,26 +226,36 @@ async def velocity_report(
     project_id: UUID = Query(...),
     limit: int = Query(default=6, ge=1, le=20),
 ) -> JSONResponse:
-    rows = list(
-        (
-            await session.execute(
-                select(ReportItemFact).where(
-                    ReportItemFact.tenant_id == principal.tenant_id,
-                    ReportItemFact.project_id == project_id,
-                    ReportItemFact.sprint_id.is_not(None),
-                )
+    rows = (
+        await session.execute(
+            select(
+                ReportItemFact.sprint_id,
+                func.coalesce(func.sum(ReportItemFact.estimate_points), 0).label("committed"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                ReportItemFact.status == "DONE",
+                                ReportItemFact.estimate_points,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("completed"),
             )
-        ).scalars()
-    )
-    sprints: dict[str, dict[str, float]] = defaultdict(lambda: {"committed": 0, "completed": 0})
-    for row in rows:
-        if row.sprint_id is None:
-            continue
-        bucket = sprints[str(row.sprint_id)]
-        points = float(row.estimate_points or 0)
-        bucket["committed"] += points
-        if row.status == "DONE":
-            bucket["completed"] += points
+            .where(
+                ReportItemFact.tenant_id == principal.tenant_id,
+                ReportItemFact.project_id == project_id,
+                ReportItemFact.sprint_id.is_not(None),
+            )
+            .group_by(ReportItemFact.sprint_id)
+        )
+    ).all()
+    sprints: dict[str, dict[str, float]] = {
+        str(sprint_id): {"committed": float(committed or 0), "completed": float(completed or 0)}
+        for sprint_id, committed, completed in rows
+    }
     snapshots = {
         str(row.sprint_id): row
         for row in (
@@ -273,21 +295,27 @@ async def burndown_report(
     sprint_id: UUID = Query(...),
 ) -> JSONResponse:
     snapshot = await session.get(ReportSprintFact, sprint_id)
-    items = list(
-        (
-            await session.execute(
-                select(ReportItemFact).where(
-                    ReportItemFact.tenant_id == principal.tenant_id,
-                    ReportItemFact.sprint_id == sprint_id,
-                )
+    if snapshot is not None and snapshot.tenant_id != principal.tenant_id:
+        raise ApiError(404, "not_found", "Sprint not found.")
+    total_row = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(ReportItemFact.estimate_points), 0),
+                func.min(ReportItemFact.created_at),
+            ).where(
+                ReportItemFact.tenant_id == principal.tenant_id,
+                ReportItemFact.sprint_id == sprint_id,
             )
-        ).scalars()
-    )
-    total = sum(float(item.estimate_points or 0) for item in items)
+        )
+    ).one()
+    total = float(total_row[0] or 0)
+    first_created = total_row[1]
     start_day = (
         snapshot.started_at.date()
         if snapshot and snapshot.started_at
-        else min((item.created_at.date() for item in items), default=datetime.now(tz=UTC).date())
+        else (
+            first_created.date() if first_created else datetime.now(tz=UTC).date()
+        )
     )
     end_day = (
         snapshot.completed_at.date()
@@ -296,10 +324,21 @@ async def burndown_report(
     )
     if end_day < start_day:
         end_day = start_day
-    done_by_day: dict[date, float] = defaultdict(float)
-    for item in items:
-        if item.completed_at is not None:
-            done_by_day[item.completed_at.date()] += float(item.estimate_points or 0)
+    done_rows = (
+        await session.execute(
+            select(
+                func.date(ReportItemFact.completed_at),
+                func.coalesce(func.sum(ReportItemFact.estimate_points), 0),
+            )
+            .where(
+                ReportItemFact.tenant_id == principal.tenant_id,
+                ReportItemFact.sprint_id == sprint_id,
+                ReportItemFact.completed_at.is_not(None),
+            )
+            .group_by(func.date(ReportItemFact.completed_at))
+        )
+    ).all()
+    done_by_day = {day: float(points or 0) for day, points in done_rows}
     series = []
     remaining = total
     day = start_day
@@ -329,55 +368,91 @@ async def monitoring_report(
     aggregate: bool = Query(default=True),
 ) -> JSONResponse:
     start, end = _range(from_date, to_date)
-    captures = list(
-        (
-            await session.execute(
-                select(ReportMonitorFact).where(
-                    ReportMonitorFact.tenant_id == principal.tenant_id,
-                    ReportMonitorFact.captured_at >= start,
-                    ReportMonitorFact.captured_at < end,
-                )
+    capture_rows = (
+        await session.execute(
+            select(
+                func.date(ReportMonitorFact.captured_at).label("day"),
+                func.count().label("captures"),
+                func.coalesce(
+                    func.sum(case((ReportMonitorFact.state == "DELETED", 1), else_=0)),
+                    0,
+                ).label("deletions"),
             )
-        ).scalars()
-    )
-    sessions = list(
-        (
-            await session.execute(
-                select(ReportSessionFact).where(
-                    ReportSessionFact.tenant_id == principal.tenant_id,
-                    ReportSessionFact.started_at >= start,
-                    ReportSessionFact.started_at < end,
-                )
+            .where(
+                ReportMonitorFact.tenant_id == principal.tenant_id,
+                ReportMonitorFact.captured_at >= start,
+                ReportMonitorFact.captured_at < end,
             )
-        ).scalars()
+            .group_by(func.date(ReportMonitorFact.captured_at))
+        )
+    ).all()
+    session_rows = (
+        await session.execute(
+            select(
+                ReportSessionFact.user_id,
+                func.count().label("sessions"),
+                func.coalesce(func.sum(ReportSessionFact.duration_seconds), 0).label(
+                    "active_seconds"
+                ),
+            )
+            .where(
+                ReportSessionFact.tenant_id == principal.tenant_id,
+                ReportSessionFact.started_at >= start,
+                ReportSessionFact.started_at < end,
+            )
+            .group_by(ReportSessionFact.user_id)
+        )
+    ).all()
+    per_user_captures = (
+        await session.execute(
+            select(
+                ReportMonitorFact.user_id,
+                func.count().label("captures"),
+                func.coalesce(
+                    func.sum(case((ReportMonitorFact.state == "DELETED", 1), else_=0)),
+                    0,
+                ).label("deletions"),
+            )
+            .where(
+                ReportMonitorFact.tenant_id == principal.tenant_id,
+                ReportMonitorFact.captured_at >= start,
+                ReportMonitorFact.captured_at < end,
+            )
+            .group_by(ReportMonitorFact.user_id)
+        )
+    ).all()
+    distinct_users = len(
+        {row[0] for row in per_user_captures} | {row[0] for row in session_rows}
     )
-    distinct_users = len({row.user_id for row in captures} | {row.user_id for row in sessions})
     threshold = request.app.state.settings.aggregation_min_users
     suppressed = aggregate and 0 < distinct_users < threshold
     per_day: dict[str, dict[str, int]] = defaultdict(lambda: {"captures": 0, "deletions": 0})
+    deleted = 0
+    for day, captures, deletions in capture_rows:
+        day_key = day.isoformat()
+        per_day[day_key]["captures"] = int(captures)
+        per_day[day_key]["deletions"] = int(deletions)
+        deleted += int(deletions)
     per_user: dict[str, dict[str, int]] = defaultdict(
         lambda: {"captures": 0, "deletions": 0, "active_seconds": 0}
     )
-    deleted = 0
-    for capture in captures:
-        day = capture.captured_at.date().isoformat()
-        per_day[day]["captures"] += 1
-        per_user[str(capture.user_id)]["captures"] += 1
-        if capture.state == "DELETED":
-            deleted += 1
-            per_day[day]["deletions"] += 1
-            per_user[str(capture.user_id)]["deletions"] += 1
-    for session_row in sessions:
-        per_user[str(session_row.user_id)]["active_seconds"] += session_row.duration_seconds
+    for user_id, captures, deletions in per_user_captures:
+        per_user[str(user_id)]["captures"] = int(captures)
+        per_user[str(user_id)]["deletions"] = int(deletions)
+    for user_id, count, active_seconds in session_rows:
+        per_user[str(user_id)]["active_seconds"] = int(active_seconds or 0)
+        per_user[str(user_id)]["sessions"] = int(count)
     payload: dict[str, Any] = {
         "from": start.date().isoformat(),
         "to": (end - timedelta(days=1)).date().isoformat(),
         "totals": {
-            "sessions": len(sessions),
-            "captures": len(captures),
+            "sessions": sum(int(row[1]) for row in session_rows),
+            "captures": sum(int(row[1]) for row in capture_rows),
             "deletions": deleted,
-            "deletion_rate": round(deleted / len(captures), 4) if captures else 0.0,
-            "active_seconds": sum(row.duration_seconds for row in sessions),
+            "deletion_rate": round(deleted / sum(int(row[1]) for row in capture_rows), 4)
+            if capture_rows
+            else 0.0,
+            "active_seconds": sum(int(row[2] or 0) for row in session_rows),
         },
         "days": [
             {"date": day, **values} for day, values in sorted(per_day.items())

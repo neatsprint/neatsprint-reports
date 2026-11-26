@@ -120,6 +120,12 @@ async def handle_event(session: AsyncSession, fields: dict[str, Any]) -> bool:
                     updated_at=occurred,
                 )
             )
+    elif event_type in ("item.deleted",):
+        item_id = _uuid(payload.get("item_id"))
+        if item_id:
+            existing_item = await session.get(ReportItemFact, item_id)
+            if existing_item is not None and existing_item.tenant_id == tenant_id:
+                await session.delete(existing_item)
     elif event_type == "item.transitioned":
         item_id = _uuid(payload.get("item_id"))
         status = str(payload.get("to") or "")

@@ -5,7 +5,11 @@ from datetime import UTC, date, datetime
 from uuid import uuid4
 
 from neatsprint_reports.api.router import _range
-from neatsprint_reports.db.models import ReportProcessedEvent, ReportTimeFact
+from neatsprint_reports.db.models import (
+    ReportItemFact,
+    ReportProcessedEvent,
+    ReportTimeFact,
+)
 from neatsprint_reports.services import cache
 from neatsprint_reports.services.projector import handle_event
 
@@ -15,6 +19,7 @@ class _FakeSession:
         self.processed = processed
         self.merged: list[object] = []
         self.added: list[object] = []
+        self.deleted: list[object] = []
         self.committed = False
 
     async def get(self, model: object, key: object) -> object | None:
@@ -31,7 +36,7 @@ class _FakeSession:
         self.committed = True
 
     async def delete(self, instance: object) -> None:
-        return None
+        self.deleted.append(instance)
 
 
 def _event(event_type: str = "time_entry.recorded", **overrides: object) -> dict[str, object]:
@@ -76,6 +81,34 @@ async def test_duplicate_event_is_ignored() -> None:
 
     assert await handle_event(session, _event()) is False
     assert session.merged == []
+
+
+async def test_item_deleted_event_removes_projection() -> None:
+    tenant = uuid4()
+    session = _FakeSession(processed=None)
+    session.processed = None
+    fact = ReportItemFact(
+        item_id=uuid4(),
+        tenant_id=tenant,
+        project_id=uuid4(),
+        title="Deleted",
+        status="TODO",
+        created_at=datetime(2026, 11, 24, tzinfo=UTC),
+    )
+
+    class _ItemSession(_FakeSession):
+        async def get(self, model: object, key: object) -> object | None:
+            return fact if model is ReportItemFact else None
+
+    item_session = _ItemSession()
+    event = _event(
+        "item.deleted",
+        tenant_id=str(tenant),
+        data=json.dumps({"item_id": str(fact.item_id)}),
+    )
+
+    assert await handle_event(item_session, event) is True
+    assert item_session.deleted == [fact]
 
 
 def test_cache_is_tenant_scoped() -> None:
